@@ -1,0 +1,26 @@
+name: claude-warmup
+
+# Sends a tiny "hi" to Claude so the 5-hour usage window starts on a fixed schedule.
+# Cron times are UTC. Defaults below = 06:00, 11:00, 16:00, 21:00 IST (UTC+5:30).
+# GitHub may start scheduled runs 5-30 min late.
+on:
+  schedule:
+    - cron: '30 0 * * *'    # 06:00 IST
+    - cron: '30 5 * * *'    # 11:00 IST
+    - cron: '30 10 * * *'   # 16:00 IST
+    - cron: '30 15 * * *'   # 21:00 IST
+  workflow_dispatch:         # manual "Run workflow" button for testing
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g @anthropic-ai/claude-code
+      - name: Say hi
+        run: claude -p "hi" --model haiku
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
