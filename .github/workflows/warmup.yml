@@ -1,15 +1,18 @@
 name: claude-warmup
 
-# Pings Claude, then schedules the next ping 5h05m later by writing the
-# timestamp to next_run.txt. A cheap checker runs every 30 min and only
-# pings when that time has passed.
+# Keeps a Claude 5-hour usage window always running.
 #
-# Why 30 min: private repos get 2000 free Actions minutes/month and each
-# run bills at least 1 min (48 runs/day ~= 1440 min/month). If the repo is
-# public, minutes are free, so you can change it to '*/10 * * * *'.
+# Each ping reads the exact reset time of the current window from Claude Code
+# (its rate_limit_event), and next_run.txt is set to that reset + 30 s. A
+# checker runs every ~5 min; once the reset is less than 20 min away it waits
+# inside the job and pings right after the reset, so a new window starts
+# immediately. If you message Claude yourself first, the next ping just
+# reports that window's reset time and lines up with it.
+#
+# Public repo = free Actions minutes, so frequent checks and in-job waits cost nothing.
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '2-59/5 * * * *'   # offset from :00, when GitHub's scheduler is busiest
   workflow_dispatch:
     inputs:
       force:
@@ -25,43 +28,88 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  INTERVAL_SECONDS: 18300   # 5h05m
+  LEAD_SECONDS: 1200        # reset within 20 min -> wait for it inside the job
+  BUFFER_SECONDS: 30        # ping this long after the reset
+  FALLBACK_SECONDS: 18300   # 5h05m, only if Claude doesn't report a reset time
+  RETRY_SECONDS: 600        # after a failed ping, try again in 10 min
+  AUTH_RETRY_SECONDS: 21600 # after a rejected token, try again in 6 h (limits failure emails)
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main   # newest commit, in case a run queued behind this one already pinged
 
       - name: Is a ping due?
         id: due
         run: |
           now=$(date +%s)
           next=$(cat next_run.txt 2>/dev/null || echo 0)
-          echo "now=$(date -u -d @$now)  next=$(date -u -d @$next)"
-          if [ "${{ inputs.force }}" = "true" ] || [ "$now" -ge "$next" ]; then
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Next ping: $(date -u -d @$next '+%F %T') UTC"
+          if [ "${{ inputs.force }}" = "true" ] || [ $(( next - now )) -le $LEAD_SECONDS ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Not due yet, $(( (next - now) / 60 )) min left."
+            echo "Not due for $(( (next - now) / 60 )) min."
           fi
 
-      - name: Say hi
+      - name: Install Claude Code
         if: steps.due.outputs.run == 'true'
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude -p "hi" --model haiku
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Wait for reset, then say hi
+        if: steps.due.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-
-      - name: Schedule next ping
-        if: steps.due.outputs.run == 'true'
+          FORCE: ${{ inputs.force }}
+          NEXT: ${{ steps.due.outputs.next }}
         run: |
-          next=$(( $(date +%s) + INTERVAL_SECONDS ))
+          wait=$(( NEXT - $(date +%s) ))
+          if [ "$FORCE" != "true" ] && [ $wait -gt 0 ]; then
+            echo "Waiting $wait s for the window to reset..."
+            sleep $wait
+          fi
+
+          ok=false; auth_error=false
+          for attempt in 1 2 3; do
+            if claude -p "hi" --model haiku --output-format stream-json --verbose > out.jsonl 2> err.txt \
+               && jq -se 'map(select(.type == "result")) | .[0].is_error == false' out.jsonl > /dev/null; then
+              ok=true; break
+            fi
+            if grep -qiE 'oauth|401|unauthori|authenticat|expired|invalid.*(token|key)' err.txt out.jsonl; then
+              auth_error=true; break
+            fi
+            echo "::warning::Ping attempt $attempt failed: $(tail -c 300 err.txt)"
+            [ $attempt -lt 3 ] && sleep 60
+          done
+
+          now=$(date +%s)
+          if $ok; then
+            reset=$(jq -r 'select(.type == "rate_limit_event") | .rate_limit_info
+                           | .unifiedWindows.five_hour.resetsAt
+                             // (if .rateLimitType == "five_hour" then .resetsAt else empty end)' out.jsonl | head -1)
+            if [ -n "$reset" ] && [ "$reset" -gt "$now" ]; then
+              next=$(( reset + BUFFER_SECONDS )); why="window reset $(date -u -d @$reset '+%H:%M') UTC"
+            else
+              next=$(( now + FALLBACK_SECONDS )); why="no reset time reported, using 5h05m"
+            fi
+          elif $auth_error; then
+            echo "::error title=Claude token rejected::Run 'claude setup-token' in a terminal, then 'gh secret set CLAUDE_CODE_OAUTH_TOKEN' with the new token."
+            next=$(( now + AUTH_RETRY_SECONDS )); why="token rejected, retrying later"
+          else
+            echo "::error title=Ping failed::All 3 attempts failed; retrying in $(( RETRY_SECONDS / 60 )) min."
+            next=$(( now + RETRY_SECONDS )); why="ping failed, retrying soon"
+          fi
+
           echo "$next" > next_run.txt
-          echo "Next ping after $(date -u -d @$next) UTC"
+          echo "Next ping: $(date -u -d @$next '+%F %T') UTC ($why)"
           git config user.name "github-actions[bot]"
           git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
           git add next_run.txt
-          git commit -m "next ping: $(date -u -d @$next +'%Y-%m-%d %H:%M UTC')"
-          git push
+          git commit -m "next ping: $(date -u -d @$next '+%Y-%m-%d %H:%M UTC') ($why)"
+          git push || { git pull --rebase && git push; }
+
+          $ok
