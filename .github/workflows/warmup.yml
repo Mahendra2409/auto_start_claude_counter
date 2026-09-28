@@ -1,26 +1,67 @@
 name: claude-warmup
 
-# Sends a tiny "hi" to Claude so the 5-hour usage window starts on a fixed schedule.
-# Cron times are UTC. Defaults below = 06:00, 11:00, 16:00, 21:00 IST (UTC+5:30).
-# GitHub may start scheduled runs 5-30 min late.
+# Pings Claude, then schedules the next ping 5h05m later by writing the
+# timestamp to next_run.txt. A cheap checker runs every 30 min and only
+# pings when that time has passed.
+#
+# Why 30 min: private repos get 2000 free Actions minutes/month and each
+# run bills at least 1 min (48 runs/day ~= 1440 min/month). If the repo is
+# public, minutes are free, so you can change it to '*/10 * * * *'.
 on:
   schedule:
-    - cron: '30 0 * * *'    # 06:00 IST
-    - cron: '30 5 * * *'    # 11:00 IST
-    - cron: '30 10 * * *'   # 16:00 IST
-    - cron: '30 15 * * *'   # 21:00 IST
-  workflow_dispatch:         # manual "Run workflow" button for testing
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Ping now, ignoring the schedule'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: claude-warmup
+  cancel-in-progress: false
+
+env:
+  INTERVAL_SECONDS: 18300   # 5h05m
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: npm install -g @anthropic-ai/claude-code
+      - uses: actions/checkout@v4
+
+      - name: Is a ping due?
+        id: due
+        run: |
+          now=$(date +%s)
+          next=$(cat next_run.txt 2>/dev/null || echo 0)
+          echo "now=$(date -u -d @$now)  next=$(date -u -d @$next)"
+          if [ "${{ inputs.force }}" = "true" ] || [ "$now" -ge "$next" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not due yet, $(( (next - now) / 60 )) min left."
+          fi
+
       - name: Say hi
-        run: claude -p "hi" --model haiku
+        if: steps.due.outputs.run == 'true'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude -p "hi" --model haiku
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+      - name: Schedule next ping
+        if: steps.due.outputs.run == 'true'
+        run: |
+          next=$(( $(date +%s) + INTERVAL_SECONDS ))
+          echo "$next" > next_run.txt
+          echo "Next ping after $(date -u -d @$next) UTC"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+          git add next_run.txt
+          git commit -m "next ping: $(date -u -d @$next +'%Y-%m-%d %H:%M UTC')"
+          git push

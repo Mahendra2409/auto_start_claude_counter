@@ -1,20 +1,25 @@
 # auto_start_claude_counter
 
-GitHub Actions workflow that sends "hi" to Claude (Haiku) at fixed times so the
-5-hour usage window starts automatically.
+GitHub Actions workflow that sends "hi" to Claude (Haiku) every **5h05m**, so
+the 5-hour usage window restarts automatically.
+
+## How it works
+- After each ping, the workflow writes the next due time (Unix seconds) to
+  `next_run.txt` and commits it. Those commits also keep the repo active, so
+  GitHub doesn't disable the schedule after 60 days.
+- A checker runs every 30 min and pings only once that time has passed, so a
+  ping can land up to ~30 min (plus GitHub delay) after its due time.
+- Actions → claude-warmup → **Run workflow** pings immediately and restarts
+  the 5h05m cycle from now.
 
 ## Setup
-1. `claude setup-token` → copy the token it prints.
-2. Push this folder to a **private** GitHub repo.
-3. Repo → Settings → Secrets and variables → Actions → New secret
-   `CLAUDE_CODE_OAUTH_TOKEN` = the token.
-4. Actions tab → claude-warmup → Run workflow (to test).
+1. In a normal terminal (PowerShell/cmd, not the VS Code chat), run
+   `claude setup-token`, approve in the browser, then return to the terminal:
+   the token (`sk-ant-oat01-...`) is printed there.
+2. `gh secret set CLAUDE_CODE_OAUTH_TOKEN` and paste the token.
+3. `gh workflow run claude-warmup` to start the cycle.
 
-## Change the schedule
-Edit the `cron` lines in `.github/workflows/warmup.yml` (times are **UTC**;
-IST = UTC + 5:30).
-
-## Notes
-- GitHub disables scheduled workflows after 60 days without repo activity —
-  push a commit occasionally (or re-enable in the Actions tab).
-- Scheduled runs can be 5–30 min late.
+## Tuning
+- Interval: `INTERVAL_SECONDS` in `.github/workflows/warmup.yml`.
+- Checker frequency: the `cron` line (keep `*/30` on a private repo to stay
+  within the free minutes).
