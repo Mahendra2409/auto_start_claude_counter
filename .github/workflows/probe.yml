@@ -1,0 +1,23 @@
+name: probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - name: Usage endpoint
+        run: |
+          code=$(curl -s -o u.json -w '%{http_code}' https://api.anthropic.com/api/oauth/usage \
+            -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" \
+            -H "anthropic-beta: oauth-2025-04-20")
+          echo "HTTP $code"
+          jq -c '{keys: keys, five_hour: .five_hour.resets_at, err: .error.type, msg: .error.message}' u.json || head -c 300 u.json
+      - name: CLI rate-limit events
+        run: |
+          npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
+          claude --version
+          claude -p "hi" --model haiku --output-format stream-json --verbose > s.jsonl
+          jq -c '.type + "/" + (.subtype // "")' s.jsonl | sort | uniq -c
+          jq -c 'select(.type=="rate_limit_event")' s.jsonl | jq -c 'del(..|.utilization?)'
