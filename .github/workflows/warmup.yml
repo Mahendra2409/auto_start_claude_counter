@@ -2,58 +2,82 @@ name: claude-warmup
 
 # Keeps a Claude 5-hour usage window always running.
 #
-# Each ping reads the exact reset time of the current window from Claude Code
-# (its rate_limit_event), and next_run.txt is set to that reset + 30 s. A
-# checker runs every ~5 min; once the reset is less than 20 min away it waits
-# inside the job and pings right after the reset, so a new window starts
-# immediately. If you message Claude yourself first, the next ping just
-# reports that window's reset time and lines up with it.
+# The chain: each ping reads the exact reset time of the current window from
+# Claude Code (its rate_limit_event), saves reset + 30 s to next_run.txt, and
+# starts the next run of this workflow (a "waiter"). The waiter sleeps on the
+# runner until that time, pings, and starts the next waiter, and so on.
+# GitHub's cron is far too irregular to time pings (it ran twice in 8 h), so
+# it is only a backup: if a ping is more than 5 min overdue (chain broken), a
+# scheduled run pings and restarts the chain.
 #
-# Public repo = free Actions minutes, so frequent checks and in-job waits cost nothing.
+# Public repo = free Actions minutes, so a runner sleeping ~5 h costs nothing.
 on:
   schedule:
-    - cron: '2-59/5 * * * *'   # offset from :00, when GitHub's scheduler is busiest
+    - cron: '7-59/10 * * * *'
   workflow_dispatch:
     inputs:
       force:
         description: 'Ping now, ignoring the schedule'
         type: boolean
         default: true
+      chain:
+        description: 'Internal: wait for next_run.txt, then ping'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: write   # to start the next waiter
 
+# Only one waiter at a time: starting a new one cancels the old one.
+# Other runs (cron backups, manual pings) don't block each other.
 concurrency:
-  group: claude-warmup
-  cancel-in-progress: false
+  group: ${{ inputs.chain && 'claude-waiter' || format('claude-{0}', github.run_id) }}
+  cancel-in-progress: true
 
 env:
-  LEAD_SECONDS: 1200        # reset within 20 min -> wait for it inside the job
-  BUFFER_SECONDS: 30        # ping this long after the reset
-  FALLBACK_SECONDS: 18300   # 5h05m, only if Claude doesn't report a reset time
-  RETRY_SECONDS: 600        # after a failed ping, try again in 10 min
-  AUTH_RETRY_SECONDS: 21600 # after a rejected token, try again in 6 h (limits failure emails)
+  BUFFER_SECONDS: 30          # ping this long after the reset
+  OVERDUE_SECONDS: 300        # cron backup pings only when this late (chain broken)
+  MAX_WAIT_SECONDS: 19800     # a waiter waits at most 5.5 h (job limit is 6 h)
+  FALLBACK_SECONDS: 18300     # 5h05m, only if Claude doesn't report a reset time
+  RETRY_SECONDS: 600          # after a failed ping, try again in 10 min
+  AUTH_RETRY_SECONDS: 21600   # after a rejected token, try again in 6 h
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: main   # newest commit, in case a run queued behind this one already pinged
+          ref: main   # newest next_run.txt
 
       - name: Is a ping due?
         id: due
+        env:
+          FORCE: ${{ inputs.force }}
+          CHAIN: ${{ inputs.chain }}
         run: |
           now=$(date +%s)
           next=$(cat next_run.txt 2>/dev/null || echo 0)
+          wait=$(( next - now ))
           echo "next=$next" >> "$GITHUB_OUTPUT"
           echo "Next ping: $(date -u -d @$next '+%F %T') UTC"
-          if [ "${{ inputs.force }}" = "true" ] || [ $(( next - now )) -le $LEAD_SECONDS ]; then
+          if [ "$FORCE" = "true" ]; then
+            echo "Manual ping."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$CHAIN" = "true" ]; then
+            if [ $wait -le $MAX_WAIT_SECONDS ]; then
+              echo "Waiter: will ping in $(( wait > 0 ? wait / 60 : 0 )) min."
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Waiter: next ping is over 5.5 h away; the cron backup will handle it."
+            fi
+          elif [ $wait -le -$OVERDUE_SECONDS ]; then
+            echo "::warning::Ping overdue by $(( -wait / 60 )) min, so the chain broke. Pinging and restarting it."
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Not due for $(( (next - now) / 60 )) min."
+            echo "Backup check: nothing to do."
           fi
 
       - name: Install Claude Code
@@ -64,12 +88,13 @@ jobs:
         if: steps.due.outputs.run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
           NEXT: ${{ steps.due.outputs.next }}
         run: |
           wait=$(( NEXT - $(date +%s) ))
           if [ "$FORCE" != "true" ] && [ $wait -gt 0 ]; then
-            echo "Waiting $wait s for the window to reset..."
+            echo "Waiting until $(date -u -d @$NEXT '+%T') UTC..."
             sleep $wait
           fi
 
@@ -88,6 +113,7 @@ jobs:
 
           now=$(date +%s)
           if $ok; then
+            echo "Pinged at $(date -u -d @$now '+%T') UTC."
             reset=$(jq -r 'select(.type == "rate_limit_event") | .rate_limit_info
                            | .unifiedWindows.five_hour.resetsAt
                              // (if .rateLimitType == "five_hour" then .resetsAt else empty end)' out.jsonl | head -1)
@@ -113,5 +139,9 @@ jobs:
             git commit -m "next ping: $(date -u -d @$next '+%Y-%m-%d %H:%M UTC') ($why)"
             git push || { git pull --rebase && git push; }
           fi
+
+          # Start the next waiter (it replaces any older one).
+          gh workflow run warmup.yml --ref main -f force=false -f chain=true
+          echo "Started the next waiter."
 
           $ok

@@ -7,8 +7,12 @@ running, by sending "hi" (Haiku) right after each window resets.
 - Each ping runs `claude -p` with `--output-format stream-json`, which reports
   the exact reset time of the current 5-hour window. `next_run.txt` is set to
   that time + 30 s and committed.
-- A checker runs about every 5 min. When the reset is under 20 min away, the
-  job waits for it and pings right after, so a new window starts immediately.
+- The ping then starts the next run of the workflow (a "waiter"). The waiter
+  sleeps on GitHub's runner until that time, pings, and starts the next
+  waiter, so the chain keeps itself going. Only one waiter exists at a time.
+- GitHub's cron is too irregular to time pings, so it is only a backup: if a
+  ping is more than 5 min overdue (chain broken), a scheduled run pings and
+  restarts the chain.
 - If you message Claude yourself first, the next ping just reads that window's
   reset time and lines up with it.
 - Failed pings retry 3 times, then again in 10 min. A rejected token shows a
@@ -27,7 +31,8 @@ running, by sending "hi" (Haiku) right after each window resets.
 "next ping: ..." commit says when the next ping is due and why.
 
 ## Limits
-- GitHub doesn't guarantee cron timing; under load, checks can be 10-20+ min
-  apart. The 20 min in-job wait covers most of that.
+- A waiter run shows as "in progress" for ~5 h; that's normal.
+- If the chain breaks, recovery waits for the next cron backup run, which
+  GitHub may delay by hours. Run the workflow manually to restart it sooner.
 - The token from `claude setup-token` expires (about a year). Repeat Setup
   steps 1-2 when you see the "Claude token rejected" error.
