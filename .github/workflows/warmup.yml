@@ -29,12 +29,6 @@ permissions:
   contents: write
   actions: write   # to start the next waiter
 
-# Only one waiter at a time: starting a new one cancels the old one.
-# Other runs (cron backups, manual pings) don't block each other.
-concurrency:
-  group: ${{ inputs.chain && 'claude-waiter' || format('claude-{0}', github.run_id) }}
-  cancel-in-progress: true
-
 env:
   BUFFER_SECONDS: 30          # ping this long after the reset
   OVERDUE_SECONDS: 300        # cron backup pings only when this late (chain broken)
@@ -42,11 +36,21 @@ env:
   FALLBACK_SECONDS: 18300     # 5h05m, only if Claude doesn't report a reset time
   RETRY_SECONDS: 600          # after a failed ping, try again in 10 min
   AUTH_RETRY_SECONDS: 21600   # after a rejected token, try again in 6 h
+  PING_TIMEOUT_SECONDS: 120   # give up on a hung `claude -p` after this long
 
 jobs:
-  ping:
+  wait:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    # Only one sleeping waiter at a time: starting a new one cancels the old
+    # one. Only this job is in the group, so when a waiter's ping job starts
+    # the next waiter, its own (already finished) wait job isn't cancelled.
+    # Other runs (cron backups, manual pings) don't block each other.
+    concurrency:
+      group: ${{ inputs.chain && 'claude-waiter' || format('claude-{0}', github.run_id) }}
+      cancel-in-progress: true
+    outputs:
+      run: ${{ steps.due.outputs.run }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -80,15 +84,9 @@ jobs:
             echo "Backup check: nothing to do."
           fi
 
-      - name: Install Claude Code
-        if: steps.due.outputs.run == 'true'
-        run: npm install -g @anthropic-ai/claude-code
-
-      - name: Wait for reset, then say hi
+      - name: Wait for reset
         if: steps.due.outputs.run == 'true'
         env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
           NEXT: ${{ steps.due.outputs.next }}
         run: |
@@ -98,16 +96,38 @@ jobs:
             sleep $wait
           fi
 
+  ping:
+    needs: wait
+    if: needs.wait.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Say hi
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
           ok=false; auth_error=false
           for attempt in 1 2 3; do
-            if claude -p "hi" --model haiku --output-format stream-json --verbose > out.jsonl 2> err.txt \
+            if timeout $PING_TIMEOUT_SECONDS claude -p "hi" --model haiku --output-format stream-json --verbose > out.jsonl 2> err.txt \
                && jq -se 'map(select(.type == "result")) | .[0].is_error == false' out.jsonl > /dev/null; then
               ok=true; break
             fi
-            if grep -qiE 'oauth|401|unauthori|authenticat|expired|invalid.*(token|key)' err.txt out.jsonl; then
+            # Only look at error text: the rest of out.jsonl is full of IDs and
+            # numbers that can contain "401" by chance.
+            errors=$(cat err.txt; jq -r 'select(.type == "result" or .error != null)
+                                         | [.error, .result, .errors] | map(select(. != null) | tostring) | .[]' out.jsonl 2>/dev/null || true)
+            if grep -qiE '\b401\b|oauth|unauthori|authenticat|expired|invalid.*(token|key)' <<< "$errors"; then
               auth_error=true; break
             fi
-            echo "::warning::Ping attempt $attempt failed: $(tail -c 300 err.txt)"
+            echo "::warning::Ping attempt $attempt failed: $(tail -c 300 <<< "$errors")"
             [ $attempt -lt 3 ] && sleep 60
           done
 
